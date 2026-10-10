@@ -549,7 +549,22 @@ async function cmdPrClose(flags) {
   // authorisation code invites the next reader to assume merged PRs can simply
   // be closed.
   if (pull.merged) {
-    die('refusing to close a merged pull request (that would misrepresent history)');
+    // A merged PR is ALSO `closed`, so this test must come first or the message
+    // the caller needs is unreachable. Closing a merged PR is refused on
+    // purpose: merge and close are different outcomes, and conflating them
+    // misrepresents history.
+    //
+    // But refusing to CLOSE must not also refuse to CLEAN UP. When the caller
+    // asked only for branch deletion, that is a legitimate merged-PR tidy-up --
+    // GitHub does the same on merge -- so fall through to the branch logic
+    // instead of dying. Dying here made `--delete-branch` dead code for exactly
+    // the most common case: a PR that merged normally and whose branch nobody
+    // deleted.
+    if (!flags['delete-branch']) {
+      die('refusing to close a merged pull request (that would misrepresent history)');
+    }
+    info('');
+    info('merged: not closing (merge and close are different outcomes); deleting the branch instead');
   } else if (pull.state === 'closed') {
     info('');
     info('already closed; nothing to do');
