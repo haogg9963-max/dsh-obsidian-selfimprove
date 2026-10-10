@@ -252,6 +252,22 @@ info('');
 info(`applying to ${repo.slug} ...`);
 info(`cache: ${cacheDir(repo)}`);
 
+/**
+ * Strip credential material out of captured child-process output.
+ *
+ * The upstream apply runs `git -c http.extraheader=AUTHORIZATION: Basic <b64>`,
+ * where <b64> is base64 of `x-access-token:<PAT>`. base64 is not encryption, so
+ * echoing that line verbatim into a terminal would expose the token. Keep the
+ * diagnostic value of stderr while removing the secret.
+ */
+function redactCredentials(text) {
+  return String(text)
+    .replace(/(http\.extraheader=\S*\s*Basic\s+)[A-Za-z0-9+/=]+/giu, '$1<redacted>')
+    .replace(/(Authorization:\s*(?:Basic|Bearer|token)\s+)[A-Za-z0-9+/=_.-]+/giu, '$1<redacted>')
+    .replace(/\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{16,}\b/gu, '<redacted:github-token>')
+    .replace(/\bgithub_pat_[A-Za-z0-9_]{20,}\b/gu, '<redacted:github-pat>');
+}
+
 let result;
 try {
   result = await tools.applyProposal.execute({
@@ -263,7 +279,38 @@ try {
   record.status = 'pending';
   delete record.approval;
   saveProposal(file, record);
-  die(`apply failed: ${error.message}\n  The proposal is back to "pending"; re-run to mint a new approval token.`);
+
+  // The upstream apply shells out to git. Node reports a failed child process
+  // as a bare "Command failed: git ...", which hides the actual reason, so dig
+  // out the captured stderr/stdout here. Without this, a real git error is
+  // invisible and the failure looks unexplained. Everything is redacted first.
+  info('');
+  info('--- apply error detail -------------------------------------------');
+  const seen = new Set();
+  let current = error;
+  let depth = 0;
+  while (current && depth < 5) {
+    const message = redactCredentials(current.message ?? current);
+    if (!seen.has(message)) {
+      seen.add(message);
+      info(`[${depth}] ${message.split('\n')[0]}`);
+    }
+    for (const field of ['stderr', 'stdout']) {
+      const value = current[field];
+      if (!value) continue;
+      const text = Buffer.isBuffer(value) ? value.toString('utf8') : String(value);
+      const trimmed = redactCredentials(text).trim();
+      if (trimmed && !seen.has(trimmed)) {
+        seen.add(trimmed);
+        info(`    ${field}: ${trimmed}`);
+      }
+    }
+    current = current.cause;
+    depth++;
+  }
+  info('------------------------------------------------------------------');
+
+  die('apply failed; the proposal is back to "pending" - re-run to mint a new approval token.');
 }
 
 record.status = 'applied';

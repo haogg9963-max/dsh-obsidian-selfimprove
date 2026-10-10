@@ -1,0 +1,17 @@
+# Local artifacts that must never be committed.
+
+# DPAPI-encrypted PAT (readable only by this Windows account, but still a secret)
+credential.dat
+
+# Plaintext token fallbacks from earlier setups
+token.txt
+*.token
+
+# Proposal records: they embed snippets of agent configuration, which can contain
+# arbitrary content and is not product source.
+proposals/
+
+# Anything that looks like a local secret or env file
+.env
+.env.*
+*.secret

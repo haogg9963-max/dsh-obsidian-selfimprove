@@ -66,13 +66,14 @@ function removeTokenFile() {
   // Only delete a file we actually read the token from: never remove a
   // user-specified path that we did not use.
   if (!usedTokenFile || !tokenFile) return;
+  // Clear the flag first so the redundant exit-handler call cannot log again.
+  usedTokenFile = false;
   try {
     rmSync(tokenFile, { force: true });
     console.log(`token file removed: ${tokenFile}`);
   } catch (error) {
     console.log(`warning: could not remove ${tokenFile} (${error.message}); delete it manually`);
   }
-  usedTokenFile = false;
 }
 
 process.on('exit', removeTokenFile);
@@ -197,6 +198,8 @@ if (flags.dryRun) {
       ['publish-proposal.mjs', 'tools/publish-proposal.mjs'],
       ['apply-proposal.mjs', 'tools/apply-proposal.mjs'],
       ['run-all.mjs', 'tools/run-all.mjs'],
+      ['secret.mjs', 'tools/secret.mjs'],
+      ['.gitignore', '.gitignore'],
     ];
     console.log('  - seed these files into the repo:');
     for (const [local, target] of pairs) {
@@ -221,6 +224,23 @@ if (/^ghp_?x*$/iu.test(token.trim()) || /^<.*>$/u.test(token.trim())) {
 
 const tokenFilePath = flags.tokenFile ?? join(HERE, 'token.txt');
 tokenFile = tokenFilePath;
+
+// Preferred source: the DPAPI-encrypted store. It keeps a plaintext credential
+// from ever having to sit on disk, and only this Windows account can decrypt it.
+if (!token.trim()) {
+  try {
+    const { loadToken, credentialPath } = await import('./secret.mjs');
+    const stored = loadToken();
+    if (stored) {
+      token = stored;
+      console.log(`token loaded from encrypted store (${credentialPath()})`);
+    }
+  } catch (error) {
+    console.log(`note: encrypted store unavailable (${error.message.split('\n')[0]})`);
+  }
+}
+
+// Fallback: a plaintext file, kept for compatibility with earlier instructions.
 if (!token.trim() && existsSync(tokenFilePath)) {
   const fromFile = readFileSync(tokenFilePath, 'utf8').trim();
   if (fromFile) {
@@ -300,6 +320,8 @@ if (flags.steps.includes('seed')) {
     ['publish-proposal.mjs', 'tools/publish-proposal.mjs'],
     ['apply-proposal.mjs', 'tools/apply-proposal.mjs'],
     ['run-all.mjs', 'tools/run-all.mjs'],
+    ['secret.mjs', 'tools/secret.mjs'],
+    ['.gitignore', '.gitignore'],
   ];
   const args = [];
   for (const [local, target] of pairs) {
