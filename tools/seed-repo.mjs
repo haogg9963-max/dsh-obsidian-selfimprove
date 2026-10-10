@@ -29,12 +29,13 @@ const API = 'https://api.github.com';
 
 function parseArgs(argv) {
   const files = [];
-  const flags = { branch: 'main', message: null, dryRun: false };
+  const flags = { branch: 'main', message: null, dryRun: false, delete: [] };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--branch') flags.branch = argv[++i];
     else if (arg === '--message') flags.message = argv[++i];
     else if (arg === '--dry-run') flags.dryRun = true;
+    else if (arg === '--delete') flags.delete.push(argv[++i]);
     else files.push(arg);
   }
   return { files, flags };
@@ -47,16 +48,47 @@ function fail(message) {
 
 const { files, flags } = parseArgs(process.argv.slice(2));
 
+/**
+ * Paths to remove from the branch in the same commit.
+ *
+ * Needed because seeding can create a file by mistake (for example a dotfile
+ * whose leading dot was stripped) and the loop can only REPLACE existing
+ * content, so it cannot clean up after itself here.
+ */
+const deletions = Array.isArray(flags.delete) ? flags.delete : [];
+
 const repo = process.env.SELF_IMPROVING_AGENT_REPO;
-const token = process.env.SELF_IMPROVING_AGENT_GITHUB_TOKEN;
+
+/**
+ * Resolve the PAT from the environment first, then the DPAPI-encrypted store.
+ *
+ * Every tool routes through this so a credential never has to be exported by
+ * hand: the encrypted store exists precisely to remove that step.
+ */
+let token = process.env.SELF_IMPROVING_AGENT_GITHUB_TOKEN ?? '';
+if (!token.trim() && !flags.dryRun) {
+  try {
+    const { loadToken } = await import('./secret.mjs');
+    token = loadToken() ?? '';
+    if (token) console.log('token loaded from encrypted store');
+  } catch (error) {
+    console.log(`note: encrypted store unavailable (${error.message.split('\n')[0]})`);
+  }
+}
+
 if (!repo || !/^[^/\s]+\/[^/\s]+$/u.test(repo)) fail('set SELF_IMPROVING_AGENT_REPO=owner/name');
 // --dry-run only previews local files, so it must not require the token.
-if (!token && !flags.dryRun) {
-  fail('set SELF_IMPROVING_AGENT_GITHUB_TOKEN (run this in your own terminal, not inside DSH)');
+if (!token.trim() && !flags.dryRun) {
+  fail(
+    'no credential available.\n' +
+      '  Store one once with:  node secret.mjs store\n' +
+      '  or export SELF_IMPROVING_AGENT_GITHUB_TOKEN for this shell.',
+  );
 }
-if (files.length === 0 || files.length % 2 !== 0) {
-  fail('provide pairs: <local-file> <repo-path> [<local-file> <repo-path> ...]');
+if ((files.length === 0 || files.length % 2 !== 0) && deletions.length === 0) {
+  fail('provide pairs: <local-file> <repo-path> [...], and/or --delete <repo-path>');
 }
+if (files.length % 2 !== 0) fail('file arguments must come in <local-file> <repo-path> pairs');
 
 const [owner, name] = repo.split('/');
 const headers = {
@@ -84,7 +116,9 @@ async function api(method, path, body) {
 const uploads = [];
 for (let i = 0; i < files.length; i += 2) {
   const local = resolve(files[i]);
-  const repoPath = files[i + 1].replace(/^[./\\]+/u, '').replace(/\\/gu, '/');
+  // Strip only a leading "./" or ".\" prefix. A blanket /^[./\\]+/ would also eat
+  // the dot of a dotfile name, silently turning ".gitignore" into "gitignore".
+  const repoPath = files[i + 1].replace(/^\.\.[\\/]/u, '').replace(/^\.[\\/]/u, '').replace(/\\/gu, '/');
   if (!existsSync(local)) fail(`local file not found: ${local}`);
   if (statSync(local).isDirectory()) fail(`local path is a directory, not a file: ${local}`);
   if (!repoPath || repoPath.includes('..')) fail(`invalid repo path: ${files[i + 1]}`);
@@ -125,7 +159,18 @@ for (const u of uploads) {
   console.log(`blob        : ${u.repoPath} -> ${blob.sha.slice(0, 12)}`);
 }
 
-const tree = await api('POST', '/git/trees', { base_tree: baseTreeSha, tree: treeEntries });
+// A tree entry with sha: null removes that path. This is how a mistaken file
+// gets cleaned up, since the self-improvement loop itself can only replace.
+for (const path of deletions) {
+  const clean = path.replace(/^\.\.[\\/]/u, '').replace(/^\.[\\/]/u, '').replace(/\\/gu, '/');
+  treeEntries.push({ path: clean, mode: '100644', type: 'blob', sha: null });
+  console.log(`delete      : ${clean}`);
+}
+
+const tree = await api('POST', '/git/trees', {
+  base_tree: baseTreeSha,
+  tree: treeEntries,
+});
 console.log(`tree        : ${tree.sha.slice(0, 12)}`);
 
 // ------------------------------------------------------------ commit and push
