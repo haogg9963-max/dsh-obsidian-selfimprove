@@ -77,20 +77,62 @@ function baseBranch() {
   return process.env.SELF_IMPROVING_AGENT_BASE_BRANCH ?? 'main';
 }
 
+
+
 /**
- * Presence-only indicator for the token: never print, log, or hash the token
- * itself. A salted fingerprint is enough to tell "same token" from "different
- * token" without being reusable.
+ * Resolve a token for the read/write GitHub calls, in priority order:
+ * environment, then the DPAPI-encrypted store.
+ *
+ * Centralised so no command grows its own credential lookup, and so a stored
+ * credential keeps working without anything having to be exported by hand.
  */
-function tokenStatus() {
-  const token = process.env.SELF_IMPROVING_AGENT_GITHUB_TOKEN;
-  if (!token) return { present: false };
-  const salt = process.env.SELF_IMPROVING_AGENT_REPO ?? 'unset-repo';
-  const fingerprint = createHash('sha256').update(`${salt}:${token}`).digest('hex').slice(0, 12);
-  return { present: true, length: token.length, fingerprint };
+async function resolveToken() {
+  const fromEnv = process.env.SELF_IMPROVING_AGENT_GITHUB_TOKEN;
+  if (fromEnv && fromEnv.trim()) return fromEnv.trim();
+  try {
+    const { loadToken } = await import('./secret.mjs');
+    const stored = loadToken();
+    if (stored) return stored;
+  } catch {
+    // Fall through: report the absence in one place instead of throwing here.
+  }
+  return null;
 }
 
+/** Headers for the GitHub REST API. Never log or echo these. */
+function githubHeaders(token) {
+  return {
+    Authorization: `Bearer ${token}`,
+    Accept: 'application/vnd.github+json',
+    'X-GitHub-Api-Version': '2022-11-28',
+    'Content-Type': 'application/json',
+    'User-Agent': 'dsh-self-improvement-bridge',
+  };
+}
+
+/**
+ * Call the GitHub REST API for the configured repo.
+ *
+ * Throws on a non-2xx response with the status and body, so a failure names its
+ * cause rather than surfacing later as an unexplained error.
+ */
+async function githubApi(token, path, options = {}) {
+  const repo = parseRepo(process.env.SELF_IMPROVING_AGENT_REPO);
+  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}${path}`;
+  const res = await fetch(url, {
+    method: options.method ?? 'GET',
+    headers: githubHeaders(token),
+    body: options.body === undefined ? undefined : JSON.stringify(options.body),
+  });
+  if (res.status === 204) return null;
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`${options.method ?? 'GET'} ${path} -> ${res.status} ${res.statusText}: ${body.slice(0, 300)}`);
+  }
+  return res.json();
+}
 function readProposal(id) {
+
   const file = join(proposalsDir(), `${id}.json`);
   if (!existsSync(file)) die(`no proposal with id ${id} in ${proposalsDir()}`);
   return { path: file, record: JSON.parse(readFileSync(file, 'utf8')) };
@@ -145,8 +187,21 @@ async function cmdDoctor() {
   info('self-improvement bridge diagnostics');
   info(`  upstream build : ${existsSync(DIST) ? 'present' : 'MISSING'}`);
   info(`  repo           : ${raw ?? '<unset>  (set SELF_IMPROVING_AGENT_REPO=owner/name)'}`);
-  const status = tokenStatus();
-  info(`  token          : ${status.present ? `present (len ${status.length}, fingerprint ${status.fingerprint})` : 'ABSENT  (apply will fail)'}`);
+
+  // Report where the credential actually comes from. Checking only the
+  // environment produced a misleading "ABSENT" while commands driven by the
+  // encrypted store worked, which sends the reader chasing a non-problem.
+  const envToken = process.env.SELF_IMPROVING_AGENT_GITHUB_TOKEN;
+  const resolved = await resolveToken();
+  let source = 'ABSENT';
+  if (envToken && envToken.trim()) source = 'environment';
+  else if (resolved) source = 'DPAPI encrypted store';
+  const fingerprint = resolved
+    ? createHash('sha256').update(`${raw ?? 'unset-repo'}:${resolved}`).digest('hex').slice(0, 12)
+    : null;
+  info(
+    `  token          : ${resolved ? `present via ${source} (len ${resolved.length}, fingerprint ${fingerprint})` : 'ABSENT  (only needed to open a PR)'}`,
+  );
   info(`  base branch    : ${baseBranch()}`);
   info(`  proposals dir  : ${proposalsDir()}`);
   if (raw) {
@@ -159,7 +214,7 @@ async function cmdDoctor() {
   const pending = allProposals().filter((p) => p.status !== 'applied');
   info(`  proposals      : ${allProposals().length} recorded, ${pending.length} not applied`);
   const warnings = [];
-  if (!status.present) warnings.push('no token: apply_proposal cannot open a PR');
+  if (!resolved) warnings.push('no credential: apply_proposal cannot open a PR (run `node secret.mjs store`)');
   if (!raw) warnings.push('no repo configured');
   if (warnings.length) {
     info('');
@@ -246,14 +301,19 @@ async function cmdApply(flags) {
 
   const upstream = await loadUpstream();
   const repo = parseRepo(process.env.SELF_IMPROVING_AGENT_REPO);
-  const status = tokenStatus();
-  if (!status.present) {
-    die(
-      'SELF_IMPROVING_AGENT_GITHUB_TOKEN is not set.\n' +
-        '  Set it in the environment for this command only, e.g.\n' +
-        '    $env:SELF_IMPROVING_AGENT_GITHUB_TOKEN = (Read-Host -AsSecureString ...)  # or your secret store\n' +
-        '  Never write the token into the vault, a skill, or a proposal file.',
-    );
+  // Look in the encrypted store too: requiring an env var here would make the
+  // stored credential useless for the one command that actually needs it.
+  const envToken = process.env.SELF_IMPROVING_AGENT_GITHUB_TOKEN;
+  if (!envToken || !envToken.trim()) {
+    const resolved = await resolveToken();
+    if (!resolved) {
+      die(
+        'no credential available.\n' +
+          '  Store one once:   node secret.mjs store\n' +
+          '  or export SELF_IMPROVING_AGENT_GITHUB_TOKEN for this shell only.',
+      );
+    }
+    process.env.SELF_IMPROVING_AGENT_GITHUB_TOKEN = resolved;
   }
 
   const { path, record } = readProposal(id);
@@ -362,10 +422,11 @@ async function cmdFirstPr(flags) {
   }
 
   // The token is only needed once we actually touch the remote.
-  if (!tokenStatus().present) {
+  if (!(await resolveToken())) {
     die(
-      'SELF_IMPROVING_AGENT_GITHUB_TOKEN is not set; the proposal was recorded but nothing was pushed.\n' +
-        `  Remove ${published.proposalId} if you did not want it, or set the token and re-run.`,
+      'no credential available; the proposal was recorded but nothing was pushed.\n' +
+        '  Store one once:   node secret.mjs store\n' +
+        `  Then re-run to apply proposal ${published.proposalId}.`,
     );
   }
 
@@ -418,7 +479,100 @@ function cmdShow(flags) {
   info(JSON.stringify(view, null, 2));
 }
 
+
+/**
+ * List pull requests, so the agent can see the loop's own output.
+ *
+ * Read-only: safe to call while reviewing, and it never modifies anything.
+ */
+async function cmdPrList(flags) {
+  const token = await resolveToken();
+  if (!token) die('no credential available; run `node secret.mjs store` once, or export SELF_IMPROVING_AGENT_GITHUB_TOKEN');
+
+  const state = flags.state ?? 'all';
+  const limit = Number(flags.limit ?? 20);
+  if (!['open', 'closed', 'all'].includes(state)) die('--state must be open, closed or all');
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) die('--limit must be 1..100');
+
+  const pulls = await githubApi(token, `/pulls?state=${state}&per_page=${limit}&sort=created&direction=desc`);
+  if (pulls.length === 0) {
+    info(`no ${state === 'all' ? '' : `${state} `}pull requests`);
+    return;
+  }
+
+  // Look up which proposal produced each PR, so the two views stay connected.
+  const byPr = new Map();
+  for (const p of allProposals()) if (p.prUrl) byPr.set(p.prUrl, p.proposalId);
+
+  for (const p of pulls) {
+    const tags = [p.draft ? 'draft' : 'ready'];
+    if (p.merged) tags.push('merged');
+    const proposal = byPr.get(p.html_url);
+    info(`#${String(p.number).padEnd(4)} ${p.state.padEnd(7)} ${tags.join(',').padEnd(13)} ${p.title}`);
+    info(`      branch: ${p.head?.ref}`);
+    info(`      url   : ${p.html_url}${proposal ? `  (proposal ${proposal})` : ''}`);
+  }
+  info('');
+  info(`${pulls.length} pull request(s)`);
+}
+
+/**
+ * Close a pull request, optionally deleting its head branch.
+ *
+ * Refuses to close a merged PR: that would misrepresent history rather than
+ * tidy it. Unlike `apply` there is no content-level approval token here,
+ * because closing does not change repository content.
+ */
+async function cmdPrClose(flags) {
+  const number = flags.pr ?? flags._;
+  if (!number) die('pr-close requires --pr <number>');
+  if (!/^\d+$/u.test(String(number))) die('--pr must be a number');
+
+  const token = await resolveToken();
+  if (!token) die('no credential available; run `node secret.mjs store` once, or export SELF_IMPROVING_AGENT_GITHUB_TOKEN');
+
+  const repo = parseRepo(process.env.SELF_IMPROVING_AGENT_REPO);
+  const repoSlug = `${repo.owner}/${repo.name}`;
+
+  const pull = await githubApi(token, `/pulls/${number}`);
+  info(`PR #${pull.number}: ${pull.title}`);
+  info(`  state  : ${pull.state}`);
+  info(`  draft  : ${pull.draft}`);
+  info(`  merged : ${pull.merged}`);
+  info(`  head   : ${pull.head?.ref}`);
+
+  if (pull.state === 'closed') {
+    info('');
+    info('already closed; nothing to do');
+  } else if (pull.merged) {
+    die('refusing to close a merged pull request (that would misrepresent history)');
+  } else {
+    const closed = await githubApi(token, `/pulls/${number}`, { method: 'PATCH', body: { state: 'closed' } });
+    info('');
+    info(`CLOSED: state is now "${closed.state}"`);
+  }
+
+  if (flags['delete-branch']) {
+    const headRef = pull.head?.ref;
+    const headRepo = pull.head?.repo?.full_name;
+    if (!headRef) {
+      info('branch not deleted: the PR does not report a head branch');
+    } else if (headRepo !== repoSlug) {
+      // A forked head, or an unexpected shape: never touch a branch we do not own.
+      info(`branch not deleted: head lives in "${headRepo ?? 'unknown'}", not in ${repoSlug}`);
+    } else {
+      const res = await fetch(
+        `https://api.github.com/repos/${repo.owner}/${repo.name}/git/refs/heads/${encodeURIComponent(headRef)}`,
+        { method: 'DELETE', headers: githubHeaders(token) },
+      );
+      if (res.status === 204) info(`branch deleted: ${headRef}`);
+      else if (res.status === 404 || res.status === 422) info(`branch not deleted (already gone or protected): ${headRef}`);
+      else info(`branch delete returned ${res.status}; leaving ${headRef} in place`);
+    }
+  }
+}
 const { positional, flags } = parseArgs(process.argv.slice(2));
+
 const command = positional[0];
 flags._ = positional[1];
 
@@ -442,12 +596,35 @@ try {
     case 'first-pr':
       await cmdFirstPr(flags);
       break;
+      break;
+    case 'first-pr':
+      await cmdFirstPr(flags);
+      break;
     case 'show':
       cmdShow(flags);
+      break;
+    case 'pr-list':
+      await cmdPrList(flags);
+      break;
+    case 'pr-close':
+      await cmdPrClose(flags);
       break;
     default:
       die(
         'usage: bridge.mjs <publish|request|apply|list|show|first-pr|doctor> [options]\n' +
+        'usage: bridge.mjs <command> [options]\n' +
+          '\n' +
+          '  proposals (local records)\n' +
+          '    publish --file <repo-relative> --find <exact> --replace <new> --reason <text> [--risk low|medium|high]\n' +
+          '    request --id <proposalId>            mint a single-use approval token\n' +
+          '    apply   --id <proposalId> --token <token>\n' +
+          '    list                                 list local proposals\n' +
+          '    show --id <proposalId>\n' +
+          '    doctor                               environment diagnostics\n' +
+          '\n' +
+          '  pull requests (remote, read/write)\n' +
+          '    pr-list [--state open|closed|all] [--limit 1..100]\n' +
+          '    pr-close --pr <number> [--delete-branch]\n',
           '  publish  --file <repo-relative> --find <exact> --replace <new> --reason <text> [--risk low|medium|high]\n' +
           '  request  --id <proposalId>\n' +
           '  apply    --id <proposalId> --token <approval token>\n' +
