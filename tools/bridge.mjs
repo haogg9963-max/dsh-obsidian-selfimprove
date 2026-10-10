@@ -541,11 +541,18 @@ async function cmdPrClose(flags) {
   info(`  merged : ${pull.merged}`);
   info(`  head   : ${pull.head?.ref}`);
 
-  if (pull.state === 'closed') {
+  // Test `merged` BEFORE `closed`. A merged PR is also `closed`, so the reverse
+  // order makes the merged branch unreachable and the caller sees
+  // "already closed; nothing to do" instead of the real reason: that closing a
+  // merged PR is refused on purpose. The behaviour was already correct (nothing
+  // was closed) but the explanation was wrong, and a wrong explanation in
+  // authorisation code invites the next reader to assume merged PRs can simply
+  // be closed.
+  if (pull.merged) {
+    die('refusing to close a merged pull request (that would misrepresent history)');
+  } else if (pull.state === 'closed') {
     info('');
     info('already closed; nothing to do');
-  } else if (pull.merged) {
-    die('refusing to close a merged pull request (that would misrepresent history)');
   } else {
     const closed = await githubApi(token, `/pulls/${number}`, { method: 'PATCH', body: { state: 'closed' } });
     info('');
